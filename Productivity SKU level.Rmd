@@ -1,0 +1,486 @@
+---
+title: "Productivity SKU"
+output: html_document
+date: "2023-02-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, messsage = FALSE}
+#Libraries
+library(lubridate)
+library(tidyverse)
+library(ggplot2)
+library(prophet)
+library(caret)
+library(e1071)
+library(dplyr)
+library(zoo)
+library(readxl)
+library(timetk)
+library(forecast)
+# library(TStools)
+library(ggplot2)
+library(tidyr)
+library(reshape2)
+library(readxl)
+library(openxlsx)
+```
+
+```{r}
+assortment_in <- read_excel("C:/Users/Yulin Pan/Desktop/woh calculation files/WOH 8.22/Indoor Assortment Report-2023.08.25.xlsx",
+     sheet = "Forecast by StockKey - PCS", 
+     skip = 4)%>%
+  select("StockKey", "HMNum 1", "Tiers", "New Category1", "New Category2", "New Category3-2", "First Scan date", "MP", "OKIOKI item", "First Cost")
+assortment_out <- read_excel("C:/Users/Yulin Pan/Desktop/woh calculation files/WOH 8.22/Outdoor Assortment 8.25.2023.xlsx", 
+     sheet = "Forecast by StockKey - PCS", 
+     skip = 3)%>%
+  mutate(StockKey = stockkey, Tiers = Tier, `First Scan date` = `First Receiving Date`, `OKIOKI item` = "", `First Cost` = `Last First Cost`)%>%
+  select("StockKey", "HMNum 1", "Tiers", "New Category1", "New Category2", "New Category3-2", "First Scan date", "MP", "OKIOKI item", "First Cost")
+Assort <- rbind(assortment_in, assortment_out)
+```
+
+
+```{r}
+sales=read_csv("C:/Users/Yulin Pan/Desktop/Productivity/2023-07/SKU Ordered Sales (49).csv")
+sales = sales[-which(sales$merchantname=="WALMARTDIRECT" & sales$orderdate==as.Date("2022-11-20")),]
+#sales = sales[-which(sales$merchantname=="AMAZONDIRECTIMPORTCKH" | sales$merchantname=="AMAZONINNETWORKCKH"| sales$merchantname=="GDFLIQUIDATION"| sales$merchantname=="OVERSTOCKLIQUIDATION"|sales$merchantname=="WAYFAIRCASTLEGATE"),]
+# sales<-sales[-c(grep(".UK",sales$merchantname)),]
+# sales<-sales[-c(grep(".CA",sales$merchantname)),]
+sales = sales[-which(sales$skuorder=="296624"),]
+sales$`pieces sold`[which(is.na(sales$`pieces sold`))]<-0
+sales$skuorder = toupper(sales$skuorder)
+
+days <- read_csv("C:/Users/Yulin Pan/Desktop/Productivity/2023-07/SKU OutOfStock Rate_Monthly (42).csv")
+skutomastersku <- read_xlsx("C:/Users/Yulin Pan/Desktop/SKU to HM/skutomastersku.xlsx")
+
+days<-days[-c(grep(".UK",days$merchantid)),]
+days<-days[-c(grep(".CA",days$merchantid)),]
+days$skuorder = toupper(days$skuorder)
+# days_12 = days[which(days$inventorymonth<=202212 & days$inventorymonth>=202201),]
+days_12 = days[which(days$online_days!=0),]
+
+First_Date <- as.Date("2022-08-01")
+Last_Date <- as.Date("2023-07-31")
+Year <- year(Last_Date)
+Month <- substr(Last_Date, 6,7)
+```
+
+```{r}
+sku_stockey_to_mastersku = read_csv("C:/Users/Yulin Pan/Desktop/SKU to HM/Master Mapping List.csv")%>%
+  # rename(`master sku` = `mastersku`,
+  #        SKU_stockey_sorted = `group stockkey`)%>%
+  mutate(`master sku` = as.character(`master sku`))%>%
+  select(`master sku`, SKU_stockey_sorted)%>%
+  group_by(`master sku`)%>%
+  summarise(SKU_stockey_sorted = max(SKU_stockey_sorted))
+
+sku_hm_map = read_csv("C:/Users/Yulin Pan/Desktop/SKU to HM/Master Mapping List.csv")%>%
+  # rename(`master sku` = `mastersku`,
+  #        SKU_stockey_sorted = `group stockkey`,
+  #        `HM_stockey` = `hm stockey`,
+  #        HM_Count = hm_count,
+  #        HM_pcs_needed = piece1)%>%
+  mutate(`master sku` = as.character(`master sku`))%>%
+  filter(!is.na(SKU_stockey_sorted))
+```
+
+
+```{r}
+mastersku_c1_c32<-sales%>%
+  group_by(`master sku`)%>%
+  summarise(`category1` = max(category1), `category3-2` = max(`category3-2`))
+
+sales_12 = sales[which(sales$orderdate<=Last_Date & sales$orderdate>=First_Date),]
+sales_12<-sales%>%
+  group_by(`master sku`)%>%
+  summarise_at(vars(`pieces sold`, `first cost`, `grosssales`, `Contribution Margin $$`), sum)%>%
+  left_join(mastersku_c1_c32, by=c("master sku"))
+sales_12$`master sku`=as.character(sales_12$`master sku`)
+
+
+
+days_avg_temp<-days_12%>%
+  left_join(skutomastersku, by=c("skuorder" = "SKU", "merchantid" = "Merchant Name"))%>%
+  group_by(`master sku`,merchantid,skuorder)%>%
+  summarise(online_days = sum(online_days))
+days_avg<-days_avg_temp%>%
+  group_by(`master sku`)%>%
+  summarise(online_days = mean(online_days))
+
+c1<-sales%>%
+  group_by(`master sku`)%>%
+  summarise(category1 = max(category1), `category3-2` = max(`category3-2`))
+c1$`master sku`=as.character(c1$`master sku`)
+
+days_avg<-days_avg%>%
+  left_join(c1, by=c("master sku"))
+
+days_cat<-days_avg%>%
+  group_by(category1, `category3-2`)%>%
+  summarise(online_days = mean(online_days))
+
+sales_dash<-sales_12%>%
+  full_join(days_avg, by=c("master sku"))%>%
+  mutate(Pcs_OH = `pieces sold`/online_days, FC_OH = `first cost`/online_days, CM_OH = `Contribution Margin $$`/online_days)
+sales_dash$`pieces sold`[(which(is.na(sales_dash$`pieces sold`)))]<-0
+sales_dash$`first cost`[(which(is.na(sales_dash$`first cost`)))]<-0
+sales_dash$grosssales[(which(is.na(sales_dash$grosssales)))]<-0
+sales_oh<-sales_dash%>%
+  filter(!is.na(online_days))%>%
+  filter(!is.na(category1.x))%>%
+  left_join(sku_stockey_to_mastersku, by=c("master sku"))
+  # group_by(`master sku`)%>%
+  # summarise(Pcs_OH = sum(Pcs_OH), 
+  #           FC_OH = sum(FC_OH), 
+  #           CM_OH = sum(CM_OH), 
+  #           CM_pcs = sum(CM_pcs))
+
+```
+
+#WebPO HMNUM Info
+```{r}
+HMNUM_Info_WebPO <- suppressWarnings(read_excel("C:/Users/Yulin Pan/Desktop/SKU to HM/HMNUM Info - WebPO.xlsx"))%>%
+  arrange(Stockey)%>%
+  filter(!duplicated(Stockey))
+```
+
+#CMS HMNUM Info
+```{r}
+Product_information <-suppressWarnings(read_excel("C:/Users/Yulin Pan/Desktop/SKU to HM/Product information.xlsx"))%>%
+  arrange(StockKey, STATUS)%>%
+  filter(!duplicated(StockKey))
+```
+#Master SKU to HM
+```{r}
+Master_SKU <- read_excel("C:/Users/Yulin Pan/Desktop/SKU to HM/Master SKU.xlsx")
+```
+
+#Master SKU adding first cost
+```{r}
+Master_SKU2 <- read_excel("C:/Users/Yulin Pan/Desktop/SKU to HM/Master SKU.xlsx")%>%
+  mutate(`Master SKU` = as.character(`Master SKU`))%>%
+  left_join(Product_information[, c(2,19)], by = c("HM stockey" = "StockKey" ))%>%
+  left_join(HMNUM_Info_WebPO[, c(3,25)], by = c("HM stockey" = "Stockey"))%>%
+  mutate(`HM Latest First Cost` = ifelse(!is.na(First), First, `LastestFirstCost-HMNUM`))%>%
+  mutate(`HM Latest First Cost in SKU` = `HM Latest First Cost`*`HM pcs needed`)%>%
+  select(-First, -`LastestFirstCost-HMNUM`)%>%
+  group_by(`Master SKU`)%>%
+  mutate(`SKU Latest First Cost` = sum(`HM Latest First Cost in SKU`, na.rm = TRUE))%>%
+  ungroup()%>%
+  mutate(`HM to SKU First Cost %` = `HM Latest First Cost in SKU`/`SKU Latest First Cost`)
+
+```
+
+```{r}
+assort_fc<-Assort%>%
+  select(StockKey, `First Cost`)
+
+fc <- read_csv("C:/Users/Yulin Pan/Downloads/SKU online details (48).csv")
+# fc <- fc[which(fc$inventorydate==as.Date("2022-12-10")),]
+sku_fc<-fc%>%
+  group_by(`master sku` = mastersku, merchantid)%>%
+  summarise(`First Cost` = max(lastest_firstcost))%>%
+  mutate(`master sku` = as.character(`master sku`))%>%
+  left_join(sku_stockey_to_mastersku, by=c("master sku"))%>%
+  group_by(SKU_stockey_sorted)%>%
+  summarise(`First Cost` = max(`First Cost`))
+
+fc2<-Master_SKU2%>%
+  group_by(`HM stockey`)%>%
+  summarise(`HM Latest First Cost` = max(`HM Latest First Cost`))
+
+fc_sku_stockey<-Master_SKU2%>%
+  group_by(`SKU stockey`)%>%
+  summarise(`SKU Latest First Cost` = max(`SKU Latest First Cost`))
+
+# sku_hm_map_cleaned<-sku_hm_map%>%
+#   group_by(SKU_stockey_sorted, `HM_stockey`)%>%
+#   summarise(HM_Count = max(HM_Count), HM_pcs_needed = max(HM_pcs_needed))%>%
+#   left_join(assort_fc, by=c("HM_stockey" = "StockKey"))%>%
+#   rename(`HM Latest First Cost` = `First Cost`)
+# 
+# loop = which(is.na(sku_hm_map_cleaned$`HM Latest First Cost`))
+# for (i in loop){
+#   if(length(which(fc2$`HM stockey` == sku_hm_map_cleaned$HM_stockey[i])) > 0){
+#     sku_hm_map_cleaned$`HM Latest First Cost`[i] = fc2$`HM Latest First Cost`[which(fc2$`HM stockey` == sku_hm_map_cleaned$HM_stockey[i])]
+#   }
+# }
+# 
+# sku_hm_map_cleaned<-sku_hm_map_cleaned%>%
+#   filter(!is.na(`HM Latest First Cost`))%>%
+#   mutate(`HM Latest First Cost` = as.numeric(`HM Latest First Cost`))%>%
+#   mutate(`HM Latest First Cost in SKU` = `HM Latest First Cost` * HM_pcs_needed)%>%
+#   left_join(sku_fc, by=c("SKU_stockey_sorted"))%>%
+#   rename(`SKU Latest First Cost` = `First Cost`)
+# 
+# loop1 = which(sku_hm_map_cleaned$`SKU Latest First Cost`==0)
+# for (i in loop1){
+#   if(length(which(fc_sku_stockey$`SKU stockey` == sku_hm_map_cleaned$SKU_stockey_sorted[i])) > 0){
+#     sku_hm_map_cleaned$`SKU Latest First Cost`[i] = fc_sku_stockey$`SKU Latest First Cost`[which(fc_sku_stockey$`SKU stockey` == sku_hm_map_cleaned$SKU_stockey_sorted[i])]
+#   }
+# }
+# sku_hm_map_cleaned<-sku_hm_map_cleaned%>%
+#   mutate(`HM to SKU First Cost %` = `HM Latest First Cost in SKU` / `SKU Latest First Cost`)
+
+DOMO_SKU_HM <- read_csv("C:/Users/Yulin Pan/Desktop/SKU to HM/Master Mapping List.csv")%>%
+  filter(!is.na(`SKU_stockey_sorted`))%>%
+  mutate(`master sku`= as.character(`master sku`))%>%
+  rename(`mastersku` = `master sku`,
+         `group stockkey` = SKU_stockey_sorted)%>%
+  mutate(SKU_stockey_sorted = `group stockkey`)%>%
+  left_join(Assort, by=c("HM_stockey" = "StockKey"))%>%
+  left_join(Stockey_Info[c(2,20)], by=c("HM_stockey" = "Stockey"))%>%
+  mutate(`HM Latest First Cost` = ifelse(!is.na(`First Cost`), `First Cost`, LastestFirstCost))%>%
+  mutate(`HM Latest First Cost in SKU` = `HM Latest First Cost`*`HM_pcs_needed`)%>%
+  group_by(`group stockkey`, channelname, sku)%>%
+  mutate(`SKU Latest First Cost` = sum(`HM Latest First Cost in SKU`, na.rm = TRUE))%>%
+  ungroup()%>%
+  mutate(`HM to SKU First Cost %` = `HM Latest First Cost in SKU`/`SKU Latest First Cost`)%>%
+  mutate(`HM to SKU First Cost %` = ifelse(is.na(`HM to SKU First Cost %`), 0, `HM to SKU First Cost %`))
+
+#Unique Master SKU to HM
+sku_hm_map_cleaned <- DOMO_SKU_HM%>%
+  group_by(SKU_stockey_sorted, HM_stockey)%>%
+  summarise(HM_Count = max(HM_Count), HM_pcs_needed = max(HM_pcs_needed),
+            `HM Latest First Cost` = max(`HM Latest First Cost`),
+              `HM Latest First Cost in SKU` = max(`HM Latest First Cost in SKU`) ,
+            `SKU Latest First Cost` = max(`SKU Latest First Cost`),
+            `HM to SKU First Cost %` = max(`HM to SKU First Cost %`))
+
+#write_xlsx(sku_hm_map_cleaned,"C:\\Users\\Yulin Pan\\Desktop\\SKU to HM\\sku_hm_map_cleaned.xlsx")
+```
+
+
+```{r}
+Daily_Sales <- sku_hm_map_cleaned%>%
+  right_join(sales_oh, by = c("SKU_stockey_sorted"))%>%
+  mutate(`HM pieces total` =  ifelse(`HM_Count`!= 1, `pieces sold`*`HM_pcs_needed`, `pieces sold`),
+         `HM pieces sold_OH` =  ifelse(`HM_Count`!= 1, `Pcs_OH`*`HM_pcs_needed`, `Pcs_OH`), 
+         `HM First Cost total` = `first cost`*`HM to SKU First Cost %`,
+         `HM First Cost_OH` = `FC_OH`*`HM to SKU First Cost %`,
+         `HM Gross Sales total` = `grosssales`*`HM to SKU First Cost %`,
+         `HM CM total` = `Contribution Margin $$`*`HM to SKU First Cost %`,
+         `HM CM_OH` = CM_OH*`HM to SKU First Cost %`)%>%
+  rename(`SKU pieces sold` = `Pcs_OH`, 
+         `SKU First Cost` = `FC_OH`, 
+         `SKU CM_OH` = CM_OH,
+         `HM stockey` = HM_stockey)%>%
+  select(`SKU_stockey_sorted`, `HM stockey`, `HM_pcs_needed`, 
+         `SKU Latest First Cost`, `HM Latest First Cost`, `HM to SKU First Cost %`,
+         `SKU pieces sold`, `SKU First Cost`, `SKU CM_OH`,
+         `HM pieces total`, `HM pieces sold_OH`, `HM First Cost total`, `HM First Cost_OH`, `HM Gross Sales total`, `HM CM total`, `HM CM_OH`)%>%
+  #mutate(`Master SKU` = as.double(`Master SKU`))%>%
+  arrange(`SKU_stockey_sorted`)%>%
+  mutate_at(c("HM pieces total", "HM pieces sold_OH", "HM First Cost total", "HM First Cost_OH", "HM Gross Sales total", "HM CM total", "HM CM_OH"), ~replace_na(.,0))
+
+Daily_Sales<-Daily_Sales%>%
+  group_by(`HM stockey`)%>%
+  summarise_at(vars(`HM pieces total`, `HM pieces sold_OH`, `HM First Cost total`, `HM First Cost_OH`, `HM Gross Sales total`, `HM CM total`,`HM CM_OH`),sum)%>%
+  left_join(Assort,by=c("HM stockey" = "StockKey"))%>%
+  select(`HM stockey`, `HM pieces total`, `HM pieces sold_OH`, `HM First Cost total`, `HM First Cost_OH`, `HM Gross Sales total`, `HM CM total`, `HM CM_OH`, `New Category1`, `New Category3-2`)%>%
+  filter(!is.na(`New Category3-2`))%>%
+  mutate(`New Category3-2` = toupper(`New Category3-2`))%>%
+  #filter(`HM pieces total` != 0)%>%
+  mutate(`HM CM_pcs` = ifelse(`HM pieces total` == 0, 0, `HM CM total`/`HM pieces total`))%>%
+  group_by(`New Category1`, `New Category3-2`)%>%
+  mutate(CM_OH_min_max = ifelse(`HM pieces total` == 0, 0,(`HM CM_OH` - min(`HM CM_OH`))/(max(`HM CM_OH`)-min(`HM CM_OH`))),
+         CM_pcs_min_max = ifelse(`HM pieces total` == 0, 0,(`HM CM_pcs` - min(`HM CM_pcs`))/(max(`HM CM_pcs`)-min(`HM CM_pcs`))))%>%
+  mutate_at(c("CM_OH_min_max","CM_pcs_min_max"), ~replace_na(.,1))%>%
+  ungroup()
+
+
+# Total_Sales <- Master_SKU2%>%
+#   full_join(sales_12, by = c("Master SKU" = "master sku"))%>%
+#   mutate(`HM pieces sold` =  ifelse(`SKU count`!= 1, `pieces sold`*`HM_pcs_needed`, `pieces sold`), 
+#          `HM First Cost` = `first cost`*`HM to SKU First Cost %`,
+#          `HM CM` = `Contribution Margin $$`*`HM to SKU First Cost %`)%>%
+#   rename(`SKU pieces sold` = `pieces sold`, 
+#          `SKU First Cost` = `first cost`, 
+#          `SKU CM` = `Contribution Margin $$`)%>%
+#   select(`Master SKU`,
+#          `SKU stockey`, `HM stockey`, `HM pcs`, `SKU count`, MP, `HM_pcs_needed`, 
+#          `SKU Latest First Cost`, `HM Latest First Cost`, `HM to SKU First Cost %`,
+#          `SKU pieces sold`, `SKU First Cost`,  `SKU CM`, 
+#          `HM pieces sold`, `HM First Cost`, `HM CM`)%>%
+#   mutate(`Master SKU` = as.character(`Master SKU`))%>%
+#   arrange(`Master SKU`)%>%
+#   mutate_at(c("HM pieces sold", "HM First Cost", "HM CM"), ~replace_na(.,0))%>%
+#   group_by(`HM stockey`)%>%
+#   summarise_at(vars(`HM pieces sold`, `HM First Cost`, `HM CM`),sum)%>%
+#   left_join(Assort,by=c("HM stockey" = "StockKey"))%>%
+#   select(`HM stockey`, `HM pieces sold`, `HM First Cost`, `HM CM`,  `New Category1`, `New Category3-2`)%>%
+#   filter(!is.na(`New Category3-2`))%>%
+#   filter(`HM pieces sold` != 0)
+  
+# Total_Sales$`HM pieces sold`[which(is.na(Total_Sales$`HM pieces sold`))]<-0
+# Total_Sales$`HM First Cost`[which(is.na(Total_Sales$`HM First Cost`))]<-0
+# Total_Sales$`HM CM`[which(is.na(Total_Sales$`HM CM`))]<-0
+
+
+Total_Sales<-Daily_Sales%>%
+  select(-c("New Category1", "New Category3-2"))
+
+Cat_Sales<-Total_Sales%>%
+  # group_by(`HM stockey`)%>%
+  # summarise_at(vars(`HM pieces sold`, `HM First Cost`, `HM CM`),sum)%>%
+  left_join(Assort, by = c("HM stockey" = "StockKey"))%>% 
+  mutate(life_cycle = round(as.numeric(Last_Date-as.Date(`First Scan date`))/365,digits = 1))%>%
+  ungroup()%>%
+  filter(!is.na(Tiers))
+
+Sales_Old <- Cat_Sales%>%
+  filter(Tiers != "Discontinued")%>%
+  filter(`First Scan date` < First_Date)%>%
+  filter(life_cycle >=1)%>%
+  filter(!is.na(`HM stockey`))%>%
+  mutate(`New Category3-2` = toupper(`New Category3-2`))
+
+Sales_New <- Cat_Sales%>%
+  filter(Tiers != "Discontinued")%>%
+  filter(`First Scan date` >= First_Date)%>%
+  filter(life_cycle >=0.5 & life_cycle <1)%>%
+  filter(!is.na(`HM stockey`))%>%
+  mutate(`New Category3-2` = toupper(`New Category3-2`))
+
+#Category Average
+Category_Old_performance <- Sales_Old%>%
+  group_by(`New Category1`, `New Category3-2`)%>%
+  summarise(choice = n(), 
+            TTL_Pcs = sum(`HM pieces total`),
+            TTL_FC = sum(`HM First Cost total`),
+            TTL_CM = sum(`HM CM total`),
+            Avg_Pcs = mean(`HM pieces total`),
+            Avg_FC = mean(`HM First Cost total`),
+            Avg_CM = mean(`HM CM total`))%>%
+  mutate(`New Category3-2` = toupper(`New Category3-2`))%>%
+  left_join(days_cat,by=c("New Category1" = "category1", "New Category3-2" = "category3-2"))%>%
+    mutate(Avg_Pcs_OH = Avg_Pcs/online_days,
+         Avg_FC_OH = Avg_FC/online_days,
+         Avg_CM_OH = Avg_CM/online_days,
+         Avg_CM_pcs = Avg_CM/Avg_Pcs)%>%
+  arrange(`New Category1`)%>%
+  ungroup()
+Category_Old_performance$online_days[which(is.na(Category_Old_performance$online_days))]<-0
+
+Category_New_performance <- Sales_New%>%
+  group_by(`New Category1`, `New Category3-2`)%>%
+  summarise(choice = n(), 
+            TTL_Pcs = sum(`HM pieces total`),
+            TTL_FC = sum(`HM First Cost total`),
+            TTL_CM = sum(`HM CM total`),
+            Avg_Pcs = mean(`HM pieces total`),
+            Avg_FC = mean(`HM First Cost total`),
+            Avg_CM = mean(`HM CM total`))%>%
+  mutate(`New Category3-2` = toupper(`New Category3-2`))%>%
+  left_join(days_cat,by=c("New Category1" = "category1", "New Category3-2" = "category3-2"))%>%
+    mutate(Avg_Pcs_OH = Avg_Pcs/online_days,
+         Avg_FC_OH = Avg_FC/online_days,
+         Avg_CM_OH = Avg_CM/online_days,
+         Avg_CM_pcs = Avg_CM/Avg_Pcs)%>%
+  arrange(`New Category1`)%>%
+  ungroup()
+Category_New_performance$online_days[which(is.na(Category_New_performance$online_days))]<-0
+
+
+#Calculating productivity score and rank
+Rank_Old<- Sales_Old%>%
+  left_join(Category_Old_performance, by = c("New Category1", "New Category3-2"))%>%
+  group_by(`New Category1`, `New Category3-2`)%>%
+  mutate(Avg_CM_pcs_min_max = mean(CM_pcs_min_max),
+         Avg_CM_OH_min_max = mean(CM_OH_min_max))%>%
+  mutate(Stockey = `HM stockey`,
+         productivity = (1/4*(`HM pieces sold_OH`/Avg_Pcs_OH)+
+                           1/4*(`HM First Cost_OH`/Avg_FC_OH)+
+                           1/4*(`CM_pcs_min_max`/Avg_CM_pcs_min_max)+
+                           1/4*(`CM_OH_min_max`/Avg_CM_OH_min_max))*100,
+         Productivity_Weight = productivity/sum(productivity),
+         min_max_productivity = (productivity - min(productivity))/(max(productivity)-min(productivity)),
+         Rank = rank(-productivity), 
+         Comment_productivity = ifelse(Rank > choice*0.8, "Bottom 20%", ""), 
+         comment_min_max = ifelse(min_max_productivity <0.2, "Bottom 20%", ""))%>%
+  ungroup()%>%
+  arrange(`New Category1`, `New Category3-2`, desc(productivity))%>%
+  # select("Stockey", "HMNum 1", 9,10,11,12,22,13,14,15,3,4,5,6,7,40,17,18,19,20,21,28,29,30,31,32,33,34,35,36,37,40,41,42,43,44,45,46)%>%
+  select(-c("Stockey"))%>%
+  filter(!is.na(`HM stockey`))
+
+Rank_New<- Sales_New%>%
+  left_join(Category_Old_performance, by = c("New Category1", "New Category3-2"))%>%
+  group_by(`New Category1`, `New Category3-2`)%>%
+  mutate(Avg_CM_pcs_min_max = mean(CM_pcs_min_max),
+         Avg_CM_OH_min_max = mean(CM_OH_min_max))%>%
+  mutate(Stockey = `HM stockey`,
+         productivity = (1/4*(`HM pieces sold_OH`/Avg_Pcs_OH)+
+                           1/4*(`HM First Cost_OH`/Avg_FC_OH)+
+                           1/4*(`CM_pcs_min_max`/Avg_CM_pcs_min_max)+
+                           1/4*(`CM_OH_min_max`/Avg_CM_OH_min_max))*100,
+         Productivity_Weight = productivity/sum(productivity),
+         min_max_productivity = (productivity - min(productivity))/(max(productivity)-min(productivity)),
+         Rank = rank(-productivity), 
+         Comment_productivity = ifelse(Rank > choice*0.8, "Bottom 20%", ""), 
+         comment_min_max = ifelse(min_max_productivity <0.2, "Bottom 20%", ""))%>%
+  ungroup()%>%
+  arrange(`New Category1`, `New Category3-2`, desc(productivity))%>%
+  # select("Stockey", "HMNum 1", 9,10,11,12,22,13,14,15,3,4,5,6,7,40,17,18,19,20,21,28,29,30,31,32,33,34,35,36,37,40,41,42,43,44,45,46)%>%
+  select(-c("Stockey"))%>%
+  filter(!is.na(`HM stockey`))
+
+
+#Export Result
+Old_New <- rbind(Rank_Old, Rank_New)
+Category <- rbind(Category_Old_performance, "","","","New", Category_New_performance)
+
+wb <- createWorkbook(paste0("C:/Users/Yulin Pan/Desktop/Productivity_", month.abb[month(Last_Date)], "-", Year, ".xlsx"))
+
+addWorksheet(wb, "Category Performance")
+addWorksheet(wb, "Old and New")
+
+writeData(wb, "Category Performance", Category)
+
+writeData(wb, "Old and New", Old_New)
+
+saveWorkbook(wb, file = paste0("C:/Users/Yulin Pan/Desktop/Productivity/2023-07/without margin/New_Productivity_", month.abb[month(Last_Date)], "-", Year, ".xlsx"), overwrite = TRUE)
+```
+
+#Category Productivity Ranking
+```{r}
+Sales_All <- Cat_Sales%>%
+  filter(Tiers != "Discontinued")%>%
+  filter(!is.na(`First Scan date`))%>%
+  filter(life_cycle >=1)
+
+
+Category32_Summary <- Sales_All%>%
+  group_by(`New Category1`, `New Category3-2`)%>%
+  summarise_at(vars(`HM Gross Sales total`, `HM First Cost total`, `HM CM total`), sum)%>%
+  mutate(`CM$$_min_max` = (`HM CM total`-min(`HM CM total`))/(max(`HM CM total`)-min(`HM CM total`)))%>%
+  ungroup()%>%
+  group_by(`New Category1`)%>%
+  mutate(C1_GS = mean(`HM Gross Sales total`), C1_FC = mean(`HM First Cost total`), C1_CM_min_max = mean(`CM$$_min_max`))%>%
+  ungroup()%>%
+  group_by(`New Category1`)%>%
+  mutate(productivity = (1/3*(`HM Gross Sales total`/C1_GS)+
+                           1/3*(`HM First Cost total`/C1_FC)+
+                           1/3*(`CM$$_min_max`/C1_CM_min_max))*100,
+         min_max_productivity = (productivity - min(productivity))/(max(productivity)-min(productivity)),
+         Productivity_Weight = productivity/sum(productivity),
+         Rank = rank(-productivity))%>%
+  ungroup()%>%
+  arrange(`New Category1`, desc(productivity))
+
+
+
+
+wb <- createWorkbook(paste0("C:/Users/Yulin Pan/Desktop/Productivity/2023-07/without margin/Category Productivity.xlsx"))
+
+addWorksheet(wb, "Category Productivity")
+
+writeData(wb, "Category Productivity", Category32_Summary)
+
+saveWorkbook(wb, file = paste0("C:/Users/Yulin Pan/Desktop/Productivity/2023-07/without margin/Category Productivity.xlsx") , overwrite = TRUE)
+```
+
+
